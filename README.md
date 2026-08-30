@@ -34,10 +34,10 @@ DeepSeek Harness is "everything is a plugin," and a dsh Web is a single long-run
 ## ✨ Features
 
 ### 1. Graceful restart — reboots only when it's safe
-- Detects real plugin updates (`cordis_define` / `cordis_run`) and **does not** restart immediately.
-- Checks every live agent (including sub-agents): if any is `running`, it **defers** and re-checks every 3s, restarting only when the agent goes **idle** (a 5-minute cap prevents a never-restart).
+- Detects a plugin **(re)activation** through the dsh plugin tools (`cordis_run`) and **does not** restart immediately.
+- Checks every live agent (including sub-agents): if any is `running`, it **defers** and re-checks every few seconds, restarting only when the agent goes **idle** (a 5-minute cap prevents a never-restart).
 - Runs the restart through `systemd-run --user` as an **independent transient unit**, so even the process being restarted survives until the reboot completes.
-- Client-only bundle changes are **hot-reloaded by dsh's own HMR** and deliberately **do not** trigger a full reboot.
+- React only to `cordis_run` — client bundle source edits that dsh's own HMR reloads are not `cordis_run` operations, so they do **not** trigger a dsh-phoenix reboot.
 
 ### 2. Client auto-reconnect — the page keeps up with the backend
 - Registers a `/__dsh_health` endpoint that returns a **per-boot token**.
@@ -50,7 +50,7 @@ DeepSeek Harness is "everything is a plugin," and a dsh Web is a single long-run
 - Re-armed, the harness's goal round driver continues driving the next iteration.
 
 ### 🧬 The whole point: a self-evolving loop
-Combine the three and you get a **cross-restart autonomous evolution loop** (verified end-to-end across multiple real dsh restarts):
+Combine the three and you get a **cross-restart autonomous evolution loop** (reproducible steps in [docs/VERIFY.md](docs/VERIFY.md)):
 
 ```
 read checkpoint → decide next step → test / modify the plugin
@@ -74,6 +74,9 @@ dsh-doctor and dsh-daemon heal the *launch*; **dsh-phoenix makes the *lifetime* 
 ---
 
 ## 📦 Requirements
+
+> [!WARNING]
+> **The graceful-restart feature requires dsh to run as a `systemd --user` service** (default unit `dsh-web`). On other setups — macOS, containers without systemd, or `pnpm run dev:web` — the restart is the one feature that cannot work. On those, either set `DSH_PHOENIX_RESTART_CMD` to a command that restarts your dsh process, or accept that only **client auto-reconnect** and **goal re-arm** are active. The plugin detects this at startup and logs `graceful restart DISABLED` so it never *silently* fails.
 
 - A DeepSeek Harness `dsh` installation whose Web runs as a **systemd --user service** (default unit `dsh-web`).
 - Node `>= 22`.
@@ -131,13 +134,17 @@ All knobs are environment variables with safe defaults — no configuration file
 | `DSH_PHOENIX_DEFER_POLL_MS` | `3000` | idle re-check interval while deferring |
 | `DSH_PHOENIX_DEFER_CAP_MS` | `300000` | max deferral before forcing a reboot |
 | `DSH_PHOENIX_HEALTH_MS` | `4000` | browser heartbeat interval |
+| `DSH_PHOENIX_RESTART_CMD` | *(empty)* | custom restart command override for non-systemd deployments (see the Requirements warning) |
+| `DSH_PHOENIX_REARM_MS` | `8000` | initial delay before the goal re-arm check |
+| `DSH_PHOENIX_REARM_RETRY_MS` | `5000` | re-check interval while waiting for a re-armable goal |
+| `DSH_PHOENIX_MAX_REARM_ATTEMPTS` | `20` | cap on re-arm checks before giving up |
 | `DSH_PHOENIX_STATE_FILE` | *(empty)* | path to the checkpoint file that enables goal re-arm; empty disables it |
 
 ---
 
 ## 🧠 How it works
 
-- **Detect** — subscribes to `tools/result` and reacts to `cordis_define` / `cordis_run`.
+- **Detect** — subscribes to `tools/result` and reacts to a plugin **(re)activation** (`cordis_run`).
 - **Defer** — if any agent is `running`, hold the restart and re-check until idle (or the cap).
 - **Reboot** — `systemd-run --user` schedules `stop → sleep → start`, decoupled from the dsh cgroup.
 - **Reconnect** — the health endpoint + injected heartbeat reload the page when the boot token changes.
@@ -149,7 +156,13 @@ Everything logs `[dsh-phoenix]` to the dsh journal for easy inspection.
 
 ## ✅ Verify it works
 
+The claims in this README are backed by a reproducible checklist in
+**[docs/VERIFY.md](docs/VERIFY.md)** and a unit-test suite (`npm test`, 10
+tests). Quick start:
+
 ```sh
+npm test                                  # 10 tests: command build, sanitize, heartbeat, narrow trigger, idle defer, re-arm + one-shot, disabled mode
+
 # after a real plugin update, watch the journal:
 journalctl --user -u dsh-web -f | grep dsh-phoenix
 # you should see "deferring (agent busy)" then, at idle, "executing deferred restart"

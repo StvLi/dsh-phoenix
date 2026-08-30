@@ -34,10 +34,10 @@ DeepSeek Harness 是"一切都是插件"，而 dsh Web 是由 *systemd* 托管�
 ## ✨ 功能特性
 
 ### 1. 优雅重启——只在安全时重启
-- 识别真正的插件更新（`cordis_define` / `cordis_run`），**不**立即重启。
-- 检查所有活体 agent（含子代理）：只要有 `running`，就**延后**，每 3s 复查，等地步**空闲**才重启（5 分钟兜底，避免永不重启）。
+- 通过 dsh 插件工具识别插件**（重新）激活**（`cordis_run`），**不**立即重启。
+- 检查所有活体 agent（含子代理）：只要有 `running`，就**延后**，每隔几秒复查，等地步**空闲**才重启（5 分钟兜底，避免永不重启）。
 - 通过 `systemd-run --user` 以**独立瞬时 unit** 执行重启，即使被重启的进程本身也能等到重启完成。
-- 客户端 bundle 变更交由 dsh 自带的 **HMR 热载**，**刻意不**触发整机重启。
+- 只响应 `cordis_run`——dsh 自带 HMR 热载的客户端 bundle 源码改动不属于 `cordis_run` 操作，因此**不会**触发 dsh-phoenix 重启。
 
 ### 2. 客户端自动重连——页面始终与后端同步
 - 注册一个 `/__dsh_health` 端点，返回**本次启动 token**。
@@ -50,7 +50,7 @@ DeepSeek Harness 是"一切都是插件"，而 dsh Web 是由 *systemd* 托管�
 - 重新武装后，harness 的目标轮次驱动会继续驱动下一轮迭代。
 
 ### 🧬 完整目标：自进化循环
-把三者组合起来，就得到一条**跨重启的自主进化闭环**（已跨多次真实 dsh 重启端到端验证）：
+把三者组合起来，就得到一条**跨重启的自主进化闭环**（可复现步骤见 [docs/VERIFY.md](docs/VERIFY.md)）：
 
 ```
 读断点 → 判断下一步 → 测试 / 修改插件
@@ -74,6 +74,9 @@ dsh-doctor 与 dsh-daemon 是在"救活启动"；**dsh-phoenix 让"生命周期"
 ---
 
 ## 📦 环境要求
+
+> [!WARNING]
+> **优雅重启功能要求 dsh 以 `systemd --user` 服务运行**（默认单元 `dsh-web`）。在其它形态下——macOS、无 systemd 的容器、或 `pnpm run dev:web`——只有重启这一项无法工作。此时要么设置 `DSH_PHOENIX_RESTART_CMD` 指向能重启你 dsh 进程的命令，要么接受只有**客户端自动重连**和**目标重新武装**生效。插件会在启动时检测并打印 `graceful restart DISABLED`，确保它**永不静默失效**。
 
 - 一个 `dsh` 安装，其 Web 以 **systemd --user 服务**运行（默认单元 `dsh-web`）。
 - Node `>= 22`。
@@ -131,13 +134,17 @@ dsh --profile <profile>
 | `DSH_PHOENIX_DEFER_POLL_MS` | `3000` | 延后期间的空闲复查间隔 |
 | `DSH_PHOENIX_DEFER_CAP_MS` | `300000` | 延后上限，超时则强制重启 |
 | `DSH_PHOENIX_HEALTH_MS` | `4000` | 浏览器心跳间隔 |
+| `DSH_PHOENIX_RESTART_CMD` | *(空)* | 非 systemd 部署的自定义重启命令覆盖（见环境要求警告） |
+| `DSH_PHOENIX_REARM_MS` | `8000` | 目标重新武装检查的初始延迟 |
+| `DSH_PHOENIX_REARM_RETRY_MS` | `5000` | 等待可重新武装目标时的复查间隔 |
+| `DSH_PHOENIX_MAX_REARM_ATTEMPTS` | `20` | 重新武装检查的最大次数（超出则放弃） |
 | `DSH_PHOENIX_STATE_FILE` | *(空)* | 启用目标重新武装所需的断点文件路径；为空则禁用 |
 
 ---
 
 ## 🧠 工作原理
 
-- **检测**——订阅 `tools/result`，响应 `cordis_define` / `cordis_run`。
+- **检测**——订阅 `tools/result`，响应插件**（重新）激活**（`cordis_run`）。
 - **延后**——若有 agent `running`，暂缓重启并复查直到空闲（或到上限）。
 - **重启**——`systemd-run --user` 调度 `stop → sleep → start`，与 dsh 的 cgroup 解耦。
 - **重连**——健康端点 + 注入心跳在启动 token 变化时刷新页面。
@@ -149,7 +156,11 @@ dsh --profile <profile>
 
 ## ✅ 如何验证它生效
 
+本 README 中的结论由 **[docs/VERIFY.md](docs/VERIFY.md)** 的可复现清单 + 单测（`npm test`，10 项）支撑。快速开始：
+
 ```sh
+npm test                                  # 10 项：命令构建、sanitize、心跳、窄触发、空闲延后、re-arm+一次性、禁用模式
+
 # 在真实插件更新后，观察 journal：
 journalctl --user -u dsh-web -f | grep dsh-phoenix
 # 你会看到 "deferring (agent busy)"，随后在地步空闲时 "executing deferred restart"
