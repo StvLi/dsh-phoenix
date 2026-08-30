@@ -4,6 +4,10 @@
 
 `dsh-phoenix` is a persistent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) host plugin that turns **"plugin update → restart dsh"** from a disruptive break into a **graceful, seamless, resumable loop** — so a running task finishes, the browser keeps up, and a long-running objective resumes and keeps evolving across restarts.
 
+<p align="center"><img src="assets/dsh-phoenix-banner.png" alt="dsh-phoenix banner" width="100%"></p>
+
+**English** · [中文版](./README.zh.md)
+
 <p>
   <a href="https://github.com/StvLi/dsh-phoenix"><img alt="GitHub repo" src="https://img.shields.io/github/v/release/StvLi/dsh-phoenix?style=flat-square&label=release"></a>
   <a href="https://github.com/StvLi/dsh-phoenix/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/StvLi/dsh-phoenix?style=flat-square"></a>

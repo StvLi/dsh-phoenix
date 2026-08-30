@@ -12,6 +12,8 @@
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "README.zh.md",
+    "assets",
     "LICENSE"
   ],
   "engines": {
