@@ -1,0 +1,6 @@
+# dsh-phoenix bundle layer — applied after dsh-base (and the installed web
+# profile) whenever a profile lists this bundle. It inserts the plugin row that
+# dsh resolves by package name `dsh-phoenix`.
+- insert:
+    - id: dsh-phoenix
+      name: dsh-phoenix

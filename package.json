@@ -1,0 +1,51 @@
+{
+  "name": "dsh-phoenix",
+  "version": "0.1.0",
+  "description": "Graceful restart + client auto-reconnect + cross-restart goal continuation for DeepSeek Harness (dsh). After a plugin update dsh-phoenix restarts dsh at a safe idle boundary, keeps the browser page connected, and resumes a running goal so a task can keep evolving across restarts.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "plugin",
+    "restart",
+    "graceful-restart",
+    "watchdog",
+    "self-healing",
+    "self-evolving",
+    "goal",
+    "continuation",
+    "resume",
+    "reconnect",
+    "hmr"
+  ],
+  "license": "MIT",
+  "author": "Steven P.LI",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/StvLi/dsh-phoenix.git"
+  },
+  "homepage": "https://github.com/StvLi/dsh-phoenix#readme",
+  "bugs": {
+    "url": "https://github.com/StvLi/dsh-phoenix/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
