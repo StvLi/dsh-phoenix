@@ -71,20 +71,33 @@ DeepSeek Harness 是"一切都是插件"，而 dsh Web 是由 *systemd* 托管�
 
 dsh-doctor 与 dsh-daemon 是在"救活启动"；**dsh-phoenix 让"生命周期"变得优雅、连接、可续跑。** 它们互补——dsh-phoenix 可以舒服地架在 dsh-daemon 管理的进程之上。
 
-### 互补而非竞争——热装 / 热重载
+### 互补而非竞争——两个轴，一套防漏的分层
 
-还有一族插件在上层**彻底避免重启**：[`dsh-hot-installer`](https://github.com/KYinCode/dsh-hot-installer)、[`dsh-hot-reload`](https://github.com/stuarthu/dsh-hot-reload)（npm：[`dsh-hot-reload`](https://www.npmjs.com/package/dsh-hot-reload)、[`@deepforce/dsh-plugin-reloader`](https://www.npmjs.com/package/@deepforce/dsh-plugin-reloader)）。当你用 **CLI `dsh plugin add`** 装插件时，它们会**就地热装、不重启 dsh**——在变更入口处就把重启挡掉。
+"phoenix" 和 "hot" 常被看作对手——都"围绕插件更新"，都为了让变更生效。这种看法误读了系统。一个 dsh 进程有**两个相互独立的轴**，两家各占其一。
 
-dsh-phoenix 则在**再下一层**：对确实仍会发生的重启——通过 dsh **cordis 工具**改动插件树、或热重载失败并标记需要重启——把它做得**优雅**（地步空闲）、**连接**（浏览器心跳）、**可续跑**（目标重新武装）。
+#### 轴 1 · 组合（dsh 由什么构成）
+dsh 是一个 Cordis *组合*：由 patch 层 diff 出来的插件行树。它在启动时被加载，但**不是冻结的**——行可以通过 loader 的 diff 机制**当场增/删/换**。dsh 自带的 HMR（`cordis-plugin-hmr`）已经能热载这一层，但它*刻意忽略 `node_modules`*，所以**升级一个已安装的插件包仍需要重启**——这正是 hot 家族要补的缺口。
 
-**触发边界清晰：**
+**hot 家族拥有这条轴。** 当你在 CLI 里 `dsh plugin add/remove/update` 一个 bundle 时，[`dsh-hot-installer`](https://github.com/KYinCode/dsh-hot-installer) 监听 profile 清单（`dsh.profile.bundles`），[`dsh-hot-reload`](https://github.com/stuarthu/dsh-hot-reload) 监听 `pnpm-lock.yaml`。它们驱动的是*与启动完全相同的挂载路径*，只是改为现场执行：解析该包、读它的 `dsh.bundle.patch`、把行注入运行中的树、重新 import 新模块（缓存失效 + 纤维重建）。失败时**回滚**到可用旧版并标记"需要重启"。它们**从不碰进程本身——从不替你重启 dsh。**
 
-| 变更路径 | 由谁处理 | dsh-phoenix 是否重启 |
-| --- | --- | --- |
-| `dsh plugin add`（CLI） | 热装 / 热重载家族 → 就地热装 | **否** |
-| 通过 dsh **cordis 工具**（`cordis_run`）改动插件树 | dsh-phoenix | **是**，优雅重启 |
+#### 轴 2 · 进程生命周期
+有些东西**不是**组合里的行，它们活在进程边界：systemd 用户单元与其 cgroup、HTTP/WebSocket 服务、内存中的目标激活、浏览器的实时连接。**这些都无法热换。** 一旦重置跨过它们，诚实的选择就是重启——而**这个重启正是 dsh-phoenix 拥有的那部分。**
 
-所以它们不竞争——hot 家族挡住*不必要的*重启；dsh-phoenix 把*必要的*重启变得安全、连接、可续跑。
+dsh-phoenix 把它做得**优雅**（地步空闲——等到没有 agent 在跑）、**连接**（注入心跳在后端启动 token 变化时刷新浏览器）、**可续跑**（重新武装被解武装的目标，长时目标得以继续）。它还通过 `systemd-run --user` 以**脱离的瞬时 unit** 执行重启，被杀的进程永远不会把重启序列一起拖下水。
+
+#### 边界由这两个轴自然得出
+二者因**变更路径不同**而不相交，且各是自己所辖轴上"正确的那把工具"：
+
+| 变更路径 | 轴 | 处理方 | dsh-phoenix 是否重启 |
+| --- | --- | --- | --- |
+| `dsh plugin add/remove/update`（CLI，已安装 bundle） | 组合 | hot 家族 → 现场挂载/重载 | **否** |
+| 通过 dsh **cordis 工具**（`cordis_run`）改动插件树 | 组合（运行时、agent 驱动） | dsh-phoenix | **是**，优雅重启 |
+| 热换**失败**（import 坏 / `apply` 抛错） | 组合 | hot 家族回滚并**标记**"需要重启" | dsh-phoenix 把这个重启做安全 |
+
+所以不是"谁抢到同一次变更"，而是**源头预防 + 兜住泄漏**：hot 家族在变更入口消除*可避免*的重启；dsh-phoenix 是下面那层，保证*剩下的、真正必要*的重启不会打断任务、不会掉浏览器、不会杀掉进行中的目标。这是经典的分层系统分隔，不是竞争。
+
+> [!NOTE]
+> **这是对当前行为的描述，不是保证。** 今天 `dsh-hot-installer` / `dsh-hot-reload` 监听 profile 清单与 lockfile，**不**响应 `cordis_run`；dsh-phoenix 监听 `tools/result`，**不**监听清单。若任一方将来扩大触发范围，请复核此表——边界是行为性的，不是架构性的。
 
 ---
 

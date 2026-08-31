@@ -71,20 +71,33 @@ The checkpoint is the loop's durable memory; the goal is its driver; the re-arm 
 
 dsh-doctor and dsh-daemon heal the *launch*; **dsh-phoenix makes the *lifetime* graceful, connected, and resumable.** They are complementary — dsh-phoenix sits comfortably on top of a dsh-daemon-managed process.
 
-### Complement, not a competitor — hot-install & hot-reload
+### Complement, not a competitor — two axes, one leak-proof layering
 
-There is a whole family that avoids the restart *entirely*, one layer up: [`dsh-hot-installer`](https://github.com/KYinCode/dsh-hot-installer), [`dsh-hot-reload`](https://github.com/stuarthu/dsh-hot-reload) (npm: [`dsh-hot-reload`](https://www.npmjs.com/package/dsh-hot-reload), [`@deepforce/dsh-plugin-reloader`](https://www.npmjs.com/package/@deepforce/dsh-plugin-reloader)). When you `dsh plugin add` a plugin from the CLI, they load it **live, with no dsh restart** — they block the reboot right at the change entry.
+"phoenix" and "hot" often read as rivals — both are "about plugin updates," both so a change takes effect. That reading mistakes the system. A dsh process has **two independent axes**, and each family owns one.
 
-dsh-phoenix lives **one layer down**: for the restarts that still legitimately happen — the plugin tree is changed through the dsh **cordis tools**, or a hot reload fails and flags a restart — it makes them **graceful** (idle-aware), **connected** (browser heartbeat), and **resumable** (goal re-arm).
+#### Axis 1 · the composition (what dsh is made of)
+dsh is a Cordis *composition*: a tree of plugin rows produced by diffing patch layers. It is applied at boot but **not frozen** — rows can be added, removed or swapped **live** through the loader's diff mechanism. dsh's own HMR (`cordis-plugin-hmr`) already hot-reloads this, but it *deliberately ignores `node_modules`*, so **upgrading an already-installed plugin package still needs a restart** — that is exactly the gap the hot family fills.
 
-**The trigger boundary is clean:**
+The **hot family owns this axis**. When you `dsh plugin add/remove/update` a bundle from the CLI, [`dsh-hot-installer`](https://github.com/KYinCode/dsh-hot-installer) watches the profile manifest (`dsh.profile.bundles`) and [`dsh-hot-reload`](https://github.com/stuarthu/dsh-hot-reload) watches `pnpm-lock.yaml`. They drive the *same boot-time mount path* live: resolve the package, read its `dsh.bundle.patch`, inject the rows into the running tree, re-import the new module (cache invalidation + fiber re-instantiation). On failure they **roll back** to the working version and flag "a restart is needed." They never touch the process — **they never restart dsh.**
 
-| Change path | Who handles it | Does dsh-phoenix restart? |
-| --- | --- | --- |
-| `dsh plugin add` (CLI) | hot-install / hot-reload family → live install | **No** |
-| Change the plugin tree via the dsh **cordis tools** (`cordis_run`) | dsh-phoenix | **Yes**, gracefully |
+#### Axis 2 · the process lifecycle
+Some things are **not** composition rows; they live at the process boundary: the systemd user unit and its cgroup, the HTTP/WebSocket server, the in-memory goal activation, the browser's live connection. **None of these hot-swap.** When a reset crosses them, the honest action is a restart — and **that restart is what dsh-phoenix owns.**
 
-So they don't compete — the hot family prevents *unnecessary* restarts; dsh-phoenix makes the *necessary* ones safe, connected, and resumable.
+dsh-phoenix makes it **graceful** (idle-aware — it waits until no agent is turning), **connected** (an injected heartbeat reloads the browser when the boot token changes), and **resumable** (it re-arms a disarmed goal so a long-running objective continues). It also runs the reboot via `systemd-run --user` as a **detached transient unit**, so the process being killed never drags the restart sequence down with it.
+
+#### The boundary falls out of the two axes
+They are disjoint because they trigger on **different change paths**, and each is the correct tool for the axis it owns:
+
+| Change path | Axis | Handler | dsh-phoenix restart? |
+| --- | --- | --- | --- |
+| `dsh plugin add/remove/update` (CLI, installed bundle) | composition | hot family → live mount / reload | **No** |
+| Plugin tree changed via the dsh **cordis tools** (`cordis_run`) | composition (runtime, agent-driven) | dsh-phoenix | **Yes**, gracefully |
+| A hot swap **fails** (bad import / `apply` throws) | composition | hot family rolls back and **flags** "restart needed" | dsh-phoenix makes that restart safe |
+
+So it is not "who wins the same change" but **prevent at the source, catch the leak**: the hot family eliminates the *avoidable* restarts at the change entry; dsh-phoenix is the layer beneath that guarantees the *remaining, genuine* restarts never interrupt work, drop the browser, or kill an in-flight objective. That is a classic layered-systems separation, not a rivalry.
+
+> [!NOTE]
+> **This is a statement about current behavior, not a guarantee.** Today `dsh-hot-installer` / `dsh-hot-reload` watch the profile manifest and lockfile and do **not** react to `cordis_run`; dsh-phoenix watches `tools/result` and does **not** watch the manifest. If either side later widens its trigger, re-check this table — the boundary is behavioral, not architectural.
 
 ---
 
