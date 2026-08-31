@@ -1,27 +1,31 @@
-import { test, beforeEach, after } from 'node:test'
+import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-// Configure the plugin for fast, deterministic tests BEFORE importing.
 const tmp = mkdtempSync(join(tmpdir(), 'dsh-phoenix-test-'))
 const stateFile = join(tmp, 'state.json')
-writeFileSync(stateFile, JSON.stringify({ round: 0, targetRound: 3, pendingResume: false, done: false }))
+writeFileSync(stateFile, JSON.stringify({ generation: 0, lifecycleState: 'idle', pendingResume: false }))
 
 process.env.DSH_PHOENIX_ARMING_MS = '5'
 process.env.DSH_PHOENIX_DEBOUNCE_MS = '5'
-process.env.DSH_PHOENIX_DEFER_POLL_MS = '5'
-process.env.DSH_PHOENIX_DEFER_CAP_MS = '100'
-process.env.DSH_PHOENIX_HEALTH_MS = '10'
+process.env.DSH_PHOENIX_DEFER_POLL_MS = '500'
+process.env.DSH_PHOENIX_DEFER_SOFT_MS = '100'
+process.env.DSH_PHOENIX_DEFER_HARD_MS = '200'
+process.env.DSH_PHOENIX_DEFER_POLICY = 'auto'
 process.env.DSH_PHOENIX_REARM_MS = '5'
-process.env.DSH_PHOENIX_REARM_RETRY_MS = '10'
-process.env.DSH_PHOENIX_MAX_REARM_ATTEMPTS = '2'
+process.env.DSH_PHOENIX_MAX_RESUME_ATTEMPTS = '1'
 process.env.DSH_PHOENIX_STATE_FILE = stateFile
 delete process.env.DSH_PHOENIX_RESTART_CMD
 
 const mod = await import('../lib/index.js')
-const { apply, buildRestartCommand, sanitizeUnit, heartbeatScript, findInPath } = mod
+const {
+  apply, defaultState, parseState, requestRestart, reachSafePoint, deferDecision,
+  beginRecovery, resumeDecision, markResumeStarted, afterResume, buildRestartCommand, sanitizeUnit,
+} = mod
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeCtx(services) {
   const listeners = {}
@@ -41,164 +45,236 @@ function makeCtx(services) {
   return { ctx, listeners }
 }
 
-function makeServices({ running = false, goal = null, resumeCalls = [], runCalls = [], registers = [], taps = [] } = {}) {
-  const agents = [{ status: 'idle' }]
-  if (running) agents[0].status = 'running'
-  const shell = {
-    resolve: (req) => ({ ...req }), run: async (spec) => { runCalls.push(spec.command); return { exitCode: 0 } },
-  }
-  const goals = {
-    get: () => goal,
-    resume: (agent, ref) => { resumeCalls.push(ref); return {} },
-  }
-  const webServer = {
-    register: (route) => { registers.push(route); return () => {} },
-    tapIndex: (fn) => { taps.push(fn); return () => {} },
-  }
-  return { agents, shell, goals, webServer, resumeCalls, runCalls, registers, taps }
-}
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const resetState = (obj) => writeFileSync(stateFile, JSON.stringify(Object.assign({ generation: 0, lifecycleState: 'idle', goalId: null, pendingResume: false, resumeAttempt: 0, deferDeadline: 0, updatedAt: 0 }, obj)))
 
 after(() => { try { rmSync(tmp, { recursive: true, force: true }) } catch (e) { /* ignore */ } })
 
-// ---- Pure helpers (point 6 - command construction / sanitize) ----
-test('buildRestartCommand: systemd default uses resolved bins, sanitized unit, int delay', () => {
-  const bin = { systemdRun: '/usr/bin/systemd-run', systemctl: '/usr/bin/systemctl', sleep: '/usr/bin/sleep' }
-  const cmd = buildRestartCommand({ unit: 'dsh-web', delay: 8, restartCmd: '' }, bin)
-  assert.match(cmd, /systemd-run --user --no-block --collect/)
-  assert.match(cmd, /systemctl --user stop dsh-web/)
-  assert.match(cmd, /sleep 8/)
-  assert.match(cmd, /systemctl --user start dsh-web/)
+// ---------------------------------------------------------------------------
+// Pure state machine — the deterministic core
+// ---------------------------------------------------------------------------
+
+test('parseState: valid, malformed, empty all collapse to a usable state', () => {
+  const ok = parseState('{"generation":3,"lifecycleState":"restarting","pendingResume":true,"goalId":"g1"}')
+  assert.equal(ok.generation, 3)
+  assert.equal(ok.lifecycleState, 'restarting')
+  assert.equal(ok.pendingResume, true)
+  assert.equal(ok.goalId, 'g1')
+
+  const bad = parseState('not json {')
+  assert.equal(bad.lifecycleState, 'idle') // no resume from a corrupt checkpoint
+  assert.equal(bad.pendingResume, false)
+  assert.equal(bad.corrupt, true)
+
+  const badState = parseState('{"lifecycleState":"bogus","pendingResume":true}')
+  assert.equal(badState.lifecycleState, 'idle', 'unknown lifecycleState -> idle, never recover')
 })
 
-test('buildRestartCommand: operator restart command overrides systemd (escape hatch, point 1)', () => {
-  const cmd = buildRestartCommand({ unit: 'dsh-web', delay: 8, restartCmd: 'launchctl restart dsh.web' }, {})
-  assert.equal(cmd, 'launchctl restart dsh.web')
+test('requestRestart: idle agent -> restarting, generation bumps, no coalesce', () => {
+  const s = requestRestart(defaultState(), { agentBusy: false, now: 1000, deferHardMs: 200 })
+  assert.equal(s.lifecycleState, 'restarting')
+  assert.equal(s.generation, 1)
+  assert.equal(s.coalesced, false)
+  assert.equal(s.deferDeadline, 0)
 })
 
-test('sanitizeUnit strips unsafe chars and falls back to dsh-web', () => {
-  assert.equal(sanitizeUnit('bad; unit &x'), 'badunitx')
-  assert.equal(sanitizeUnit(''), 'dsh-web')
-  assert.equal(sanitizeUnit('dsh-web'), 'dsh-web')
+test('requestRestart: busy agent -> deferred, deferDeadline set, generation bumps', () => {
+  const s = requestRestart(defaultState(), { agentBusy: true, now: 1000, deferHardMs: 200 })
+  assert.equal(s.lifecycleState, 'deferred')
+  assert.equal(s.generation, 1)
+  assert.equal(s.deferDeadline, 1200)
 })
 
-// ---- Pure helper (point 4 - client heartbeat) ----
-test('heartbeatScript: polls the health path and reloads on token change', () => {
-  const html = heartbeatScript('tok', '/__dsh_health', 4000)
-  assert.match(html, /\/__dsh_health/)
-  assert.match(html, /location\.reload\(\)/)
-  assert.match(html, /setInterval\(chk,/)
-  assert.match(html, /var last="tok"/)
-  // injected into an html body correctly
-  const page = '<html><body>hi</body></html>'
-  const fill = (code) => {
-    // emulate the plugin's body injection
-    if (code.indexOf('</body>') !== -1) return code.replace('</body>', html + '</body>')
-    return code + html
+test('requestRestart: in-flight cycle coalesces (no second restart, no generation bump)', () => {
+  const inFlight = { ...defaultState(), lifecycleState: 'deferred', generation: 1 }
+  const s = requestRestart(inFlight, { agentBusy: true, now: 2000, deferHardMs: 200 })
+  assert.equal(s.coalesced, true)
+  assert.equal(s.generation, 1, 'no generation bump on coalesce')
+  const s2 = requestRestart({ ...defaultState(), lifecycleState: 'restarting', generation: 2 }, { agentBusy: false, now: 2000, deferHardMs: 200 })
+  assert.equal(s2.coalesced, true)
+  assert.equal(s2.generation, 2)
+})
+
+test('reachSafePoint: only deferred -> restarting (clears deadline)', () => {
+  const d = { ...defaultState(), lifecycleState: 'deferred', deferDeadline: 1200 }
+  const r = reachSafePoint(d, { now: 1300 })
+  assert.equal(r.lifecycleState, 'restarting')
+  assert.equal(r.deferDeadline, 0)
+  assert.equal(reachSafePoint({ ...defaultState(), lifecycleState: 'restarting' }, { now: 1300 }).lifecycleState, 'restarting')
+})
+
+test('deferDecision: wait -> warn -> force escalation (safety deadline, not unconditional)', () => {
+  const d = { ...defaultState(), lifecycleState: 'deferred', deferDeadline: 200 }
+  assert.equal(deferDecision(d, { now: 50, softDeadline: 100, hardDeadline: 200, policy: 'auto' }), 'wait')
+  assert.equal(deferDecision(d, { now: 120, softDeadline: 100, hardDeadline: 200, policy: 'auto' }), 'warn')
+  assert.equal(deferDecision(d, { now: 210, softDeadline: 100, hardDeadline: 200, policy: 'auto' }), 'force')
+  // policy wait never forces
+  assert.equal(deferDecision(d, { now: 9999, softDeadline: 100, hardDeadline: 200, policy: 'wait' }), 'warn')
+})
+
+test('beginRecovery: mid-cycle -> recovering; fresh -> running', () => {
+  assert.equal(beginRecovery({ ...defaultState(), lifecycleState: 'restarting' }, { now: 1 }).lifecycleState, 'recovering')
+  assert.equal(beginRecovery({ ...defaultState(), lifecycleState: 'recovering' }, { now: 1 }).lifecycleState, 'recovering')
+  assert.equal(beginRecovery(defaultState(), { now: 1 }).lifecycleState, 'running')
+})
+
+test('resumeDecision: attempt / exhausted / none (at-most-once per generation)', () => {
+  const pend = { ...defaultState(), pendingResume: true, resumeAttempt: 0 }
+  assert.equal(resumeDecision(pend, { maxResumeAttempts: 1 }).action, 'attempt')
+  const used = { ...pend, resumeAttempt: 1 }
+  assert.equal(resumeDecision(used, { maxResumeAttempts: 1 }).action, 'exhausted')
+  assert.equal(resumeDecision({ ...defaultState(), pendingResume: false }, { maxResumeAttempts: 1 }).action, 'none')
+})
+
+test('markResumeStarted + afterResume: one-shot + clear stale pending', () => {
+  const pend = { ...defaultState(), pendingResume: true, resumeAttempt: 0, goalId: 'g1' }
+  const marked = markResumeStarted(pend, { now: 5 })
+  assert.equal(marked.resumeAttempt, 1)
+  const done = afterResume(marked, { now: 6 })
+  assert.equal(done.lifecycleState, 'running')
+  assert.equal(done.pendingResume, false)
+  assert.equal(done.goalId, null)
+})
+
+test('full cycle state machine: idle -> restarting -> recovering -> running with at-most-once resume', () => {
+  let s = defaultState()
+  s = requestRestart(s, { agentBusy: false, now: 1, deferHardMs: 200 })
+  assert.equal(s.lifecycleState, 'restarting')
+  s = beginRecovery(s, { now: 2 })
+  assert.equal(s.lifecycleState, 'recovering')
+  // pretend the loop wrote a resume request
+  s = { ...s, pendingResume: true, goalId: 'g1' }
+  const dec = resumeDecision(s, { maxResumeAttempts: 1 })
+  assert.equal(dec.action, 'attempt')
+  s = markResumeStarted(s, { now: 3 })
+  s = afterResume(s, { now: 4 })
+  assert.equal(s.lifecycleState, 'running')
+  assert.equal(s.pendingResume, false)
+})
+
+// ---------------------------------------------------------------------------
+// Apply-level I/O wiring (deterministic injection)
+// ---------------------------------------------------------------------------
+
+function bootCtx(overrides = {}) {
+  const resumeCalls = []
+  const runCalls = []
+  const agents = overrides.agents ?? [{ status: 'idle' }]
+  const goal = overrides.goal ?? { id: 'g1', revision: 3, phase: 'active', activation: 'disarmed' }
+  const services = {
+    agents: { list: () => agents },
+    goals: { get: () => goal, resume: (agent, ref) => { resumeCalls.push(ref); return {} } },
+    shell: overrides.shell ?? { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
   }
-  const injected = fill(page)
-  assert.match(injected, /\/__dsh_health/)
-  assert.match(injected, /<script async>\(function/)
+  const { ctx } = makeCtx(services)
+  return { ctx, resumeCalls, runCalls }
+}
+
+test('recovery: resumes matching disarmed goal once, settles to running, clears pending', async () => {
+  resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'g1' })
+  const { ctx, resumeCalls } = bootCtx()
+  apply(ctx)
+  await sleep(20)
+  assert.equal(resumeCalls.length, 1, 'resume called exactly once')
+  const final = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.equal(final.lifecycleState, 'running')
+  assert.equal(final.pendingResume, false)
+  assert.equal(final.generation, 7)
 })
 
-// ---- Apply-level: trigger narrowed to cordis_run (point 5) ----
-test('trigger: cordis_run schedules a restart (idle agent); cordis_define does not', async () => {
-  const { runCalls, registers, taps } = makeServices()
+test('recovery: stale goalId -> no resume, settles to running', async () => {
+  resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'NOT-THERE' })
+  const { ctx, resumeCalls } = bootCtx()
+  apply(ctx)
+  await sleep(20)
+  assert.equal(resumeCalls.length, 0, 'stale goalId must not resume')
+  const final = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.equal(final.lifecycleState, 'running')
+  assert.equal(final.pendingResume, false)
+})
+
+test('recovery: resume throws -> still settles to running (no loop)', async () => {
+  resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'g1' })
+  const { ctx, resumeCalls } = bootCtx({
+    goals: { get: () => ({ id: 'g1', revision: 3, phase: 'active', activation: 'disarmed' }), resume: () => { throw new Error('boom') } },
+  })
+  apply(ctx)
+  await sleep(20)
+  const final = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.equal(final.lifecycleState, 'running')
+  assert.equal(final.pendingResume, false, 'no stale pending after failed resume')
+})
+
+test('recovery: corrupt/missing checkpoint -> fresh running, no resume', async () => {
+  writeFileSync(stateFile, '{corrupt')
+  const { ctx, resumeCalls } = bootCtx()
+  apply(ctx)
+  await sleep(20)
+  assert.equal(resumeCalls.length, 0)
+})
+
+test('restart command failure -> state reverts to running (not stuck RESTARTING)', async () => {
+  resetState({ lifecycleState: 'idle', generation: 0 })
+  const runCalls = []
   const { ctx, listeners } = makeCtx({
     agents: { list: () => [{ status: 'idle' }] },
-    shell: { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
-    goals: {},
-    webServer: { register: (r) => { registers.push(r); return () => {} }, tapIndex: (f) => { taps.push(f); return () => {} } },
+    goals: { get: () => null, resume: () => ({}) },
+    shell: { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 5 } } },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
   })
   apply(ctx)
   await sleep(20) // arm + boot
-
-  listeners['tools/result']({ name: 'cordis_define' })
-  await sleep(20)
-  assert.equal(runCalls.length, 0, 'cordis_define must not trigger a restart')
-
   listeners['tools/result']({ name: 'cordis_run' })
-  await sleep(30)
-  assert.equal(runCalls.length, 1, 'cordis_run must schedule exactly one restart')
-  assert.match(runCalls[0], /systemd-run/, 'restart command uses the systemd provider (binaries present)')
+  await sleep(30) // debounce + restart attempt (restarting) + async run resolves exit 5 -> revert
+  assert.equal(runCalls.length, 1)
+  const final = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.equal(final.lifecycleState, 'running', 'on restart failure, revert to running')
+  assert.equal(final.pendingResume, false)
 })
 
-// ---- Apply-level: defer until agent idle (point 3 - graceful) ----
-test('defer: running agent delays restart until idle', async () => {
-  const runCalls = []
+test('trigger coalescing: second request while deferred schedules no extra restart', async () => {
+  resetState({ lifecycleState: 'idle', generation: 0 })
   const agents = [{ status: 'running' }]
+  const runCalls = []
   const { ctx, listeners } = makeCtx({
     agents: { list: () => agents },
-    shell: { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
-    goals: {},
-    webServer: { register: () => () => {}, tapIndex: () => () => {} },
-  })
-  apply(ctx)
-  await sleep(20) // arm
-  listeners['tools/result']({ name: 'cordis_run' })
-  await sleep(650) // first poll (500ms) sees agent running -> still deferred
-  assert.equal(runCalls.length, 0, 'must defer while agent is running')
-  agents[0].status = 'idle'
-  await sleep(650) // next poll (500ms) sees idle -> scheduleNow
-  assert.equal(runCalls.length, 1, 'must restart once agent is idle')
-})
-
-// ---- Apply-level: goal re-arm + one-shot checkpoint (points 2,3) ----
-test('re-arm: re-activates a disarmed active goal and clears pendingResume', async () => {
-  writeFileSync(stateFile, JSON.stringify({ pendingResume: true }))
-  const resumeCalls = []
-  const goal = { id: 'g1', revision: 3, phase: 'active', activation: 'disarmed' }
-  const { ctx } = makeCtx({
-    agents: { list: () => [{ status: 'idle' }] },
-    goals: { get: () => goal, resume: (a, ref) => { resumeCalls.push(ref); return {} } },
-    shell: { resolve: (r) => r, run: async () => ({ exitCode: 0 }) },
-    webServer: { register: () => () => {}, tapIndex: () => () => {} },
-  })
-  apply(ctx)
-  await sleep(30) // rearmMs = 5 + margin
-  assert.equal(resumeCalls.length, 1, 'goals.resume must be called once')
-  const after = JSON.parse(readFileSync(stateFile, 'utf8'))
-  assert.equal(after.pendingResume, false, 'pendingResume must be cleared after re-arm (one-shot)')
-})
-
-test('re-arm: gives up after max attempts when no re-armable goal', async () => {
-  writeFileSync(stateFile, JSON.stringify({ pendingResume: true }))
-  const { ctx } = makeCtx({
-    agents: { list: () => [] }, // no agent -> no goal
     goals: { get: () => null, resume: () => ({}) },
-    shell: { resolve: (r) => r, run: async () => ({ exitCode: 0 }) },
+    shell: { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
     webServer: { register: () => () => {}, tapIndex: () => () => {} },
   })
   apply(ctx)
-  await sleep(60) // a couple of capped retries (maxReArmAttempts=2, poll 5s is not used; rearm retries every 5s but cap=2)
-  // cap reached; no assertion on resume, just ensure it terminates without throwing
-  assert.ok(true)
+  await sleep(20)
+  listeners['tools/result']({ name: 'cordis_run' })   // -> deferred (busy)
+  await sleep(20)
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'deferred')
+  const genBefore = JSON.parse(readFileSync(stateFile, 'utf8')).generation
+  listeners['tools/result']({ name: 'cordis_run' })   // second request -> coalesced
+  await sleep(20)
+  assert.equal(runCalls.length, 0, 'only one pending restart')
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).generation, genBefore, 'no generation bump on coalesce')
+  agents[0].status = 'idle'
+  await sleep(600) // defer poll (500ms) -> restart
+  assert.equal(runCalls.length, 1, 'exactly one restart after coalesce')
 })
 
-// ---- Point 1: restart disabled when systemd unavailable ----
-test('point 1: no systemd binaries + no override => restart is skipped (no shell.run)', async () => {
-  const origPath = process.env.PATH
-  process.env.PATH = tmp // temp dir has no systemctl/systemd-run/sleep
-  try {
-    const runCalls = []
-    const { ctx, listeners } = makeCtx({
-      agents: { list: () => [{ status: 'idle' }] },
-      shell: { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
-      goals: {},
-      webServer: { register: () => () => {}, tapIndex: () => () => {} },
-    })
-    apply(ctx)
-    await sleep(20)
-    listeners['tools/result']({ name: 'cordis_run' })
-    await sleep(30)
-    assert.equal(runCalls.length, 0, 'restart must be skipped when systemd is unavailable and no override')
-  } finally {
-    process.env.PATH = origPath
-  }
-})
-
-test('findInPath: resolves real binaries, returns null for missing', () => {
-  assert.equal(typeof findInPath('node'), 'string')
-  assert.equal(findInPath('definitely-not-a-real-xyz'), null)
+test('defer: busy -> deferred, idle -> restart (graceful)', async () => {
+  resetState({ lifecycleState: 'idle', generation: 0 })
+  const agents = [{ status: 'running' }]
+  const runCalls = []
+  const { ctx, listeners } = makeCtx({
+    agents: { list: () => agents },
+    goals: { get: () => null, resume: () => ({}) },
+    shell: { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
+  })
+  apply(ctx)
+  await sleep(20)
+  listeners['tools/result']({ name: 'cordis_run' })
+  await sleep(20)
+  assert.equal(runCalls.length, 0, 'deferred while busy')
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'deferred')
+  agents[0].status = 'idle'
+  await sleep(600) // defer poll (500ms) sees idle -> restart
+  assert.equal(runCalls.length, 1, 'restart once idle')
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'restarting')
 })

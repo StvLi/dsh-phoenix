@@ -101,6 +101,68 @@ So it is not "who wins the same change" but **prevent at the source, catch the l
 
 ---
 
+## 🧭 Durable lifecycle & safe-restart semantics
+
+The restart → recovery → resume path is an explicit, **durable** state machine. State is persisted to `DSH_PHOENIX_STATE_FILE` **atomically** (`.tmp` + `rename`), so it survives a crash at any point, and a bad/missing checkpoint can never trigger a spurious resume.
+
+### States
+
+```
+ IDLE ──restart requested──▶ DEFERRED ──safe point / deadline──▶ RESTARTING ──boot / crash──▶ RECOVERING ──resume──▶ RUNNING
+   ▲                                                                                                              │
+   └────────────────────────────── new request (coalesced while in-flight) ◀──────────────────────────────────────┘
+```
+
+| State | Meaning |
+| --- | --- |
+| `idle` | no pending restart |
+| `deferred` | restart requested but an agent is running; waiting for a safe point |
+| `restarting` | the reboot is scheduled (`systemd-run`) |
+| `recovering` | booted after a restart/crash; bounded, idempotent resume of the recorded goal |
+| `running` | settled; no stale pending restart |
+
+### Transitions & invariants
+
+- `idle`/`running` — *restart requested* → `deferred` (busy) or `restarting` (idle); a new `generation` is minted.
+- `deferred` — *safe point* → `restarting`; *hard safety deadline* → `restarting` (forced, logged).
+- `restarting` — *boot / crash* → `recovering`.
+- `recovering` — *resume, at most once* → `running`.
+
+**Invariants**
+- `RESTARTING`: no second restart may be scheduled (requests coalesce).
+- `RECOVERING`: resume is attempted only for the recorded `generation`; a **stale** `goalId` (no matching live goal) is invalidated, never resumed.
+- `RUNNING`: no stale `pendingResume` may remain active.
+
+### Resume semantics — at-most-once per generation
+
+`pendingResume` is not a loose boolean; the checkpoint also records `generation`, `goalId` and `resumeAttempt`. Before calling `goals.resume()` the plugin **durably increments** `resumeAttempt` (atomic write). If the process crashes mid-resume, the next boot sees `resumeAttempt >= maxResumeAttempts` (default `1`) and does **not** resume again — so a goal is resumed **at-most-once per generation**. There is no infinite restart/resume loop: an in-flight restart is coalesced, and a failed/exhausted resume settles to `running` and clears `pendingResume`.
+
+### Safety deadline, not "restart now regardless"
+
+The defer timeout is a **deadline with escalation**, not an unconditional timer:
+
+```
+deferred (agent busy)
+  ├─ soft deadline  → log a WARNING (agent still busy)
+  └─ hard deadline  → if policy is 'auto', force the restart (logged)
+                       if policy is 'wait', keep waiting (no forced restart)
+```
+
+`DSH_PHOENIX_DEFER_POLICY=auto` (default) preserves the protection against infinite defer; `wait` removes forced restarts (you accept a possibly-long defer). **Phoenix cannot distinguish "agent busy" from "agent is in a critical section"** — DSH exposes no such signal — so busy is treated as unsafe-to-restart, and the deadline is the safety valve.
+
+### Acceptance answers
+
+1. **Crash at every point?** The durable state survives; on boot a mid-cycle state (`deferred`/`restarting`/`recovering`) moves to `recovering` and settles idempotently.
+2. **Same goal resumed twice?** No — at-most-once per `generation` (`resumeAttempt` incremented durably *before* the call).
+3. **Stale checkpoint triggers a resume?** No — a missing/corrupt checkpoint collapses to `idle`; a `goalId` that matches no live goal is invalidated, not resumed.
+4. **Repeated update events → repeated restarts?** No — in-flight requests coalesce; duplicate events produce one restart.
+5. **Infinite restart/resume loop?** No — in-flight coalescing, resume-attempt cap, and settle-to-`running` on failure/exhaustion.
+6. **Defer deadline expires while busy?** Soft → warning; hard → force (if `auto`) or keep waiting (if `wait`), all logged.
+7. **Busy vs critical section?** Phoenix cannot tell (DSH exposes no critical-section signal); it treats busy as unsafe and bounds it with the safety deadline.
+8. **Transitions deterministic & testable?** Yes — the state machine is pure functions; see `tests/` (17 tests incl. crash/stale/duplicate/failure injection).
+
+---
+
 ## 📦 Requirements
 
 > [!WARNING]
@@ -160,13 +222,14 @@ All knobs are environment variables with safe defaults — no configuration file
 | `DSH_PHOENIX_ARMING_MS` | `5000` | ignore signals for N ms after load (prevents self-trigger) |
 | `DSH_PHOENIX_DEBOUNCE_MS` | `3000` | collapse burst signals into one reboot |
 | `DSH_PHOENIX_DEFER_POLL_MS` | `3000` | idle re-check interval while deferring |
-| `DSH_PHOENIX_DEFER_CAP_MS` | `300000` | max deferral before forcing a reboot |
+| `DSH_PHOENIX_DEFER_SOFT_MS` | `300000` | soft safety deadline — log a warning at this point, keep waiting |
+| `DSH_PHOENIX_DEFER_HARD_MS` | `900000` | hard safety deadline — force the restart (if policy is `auto`) |
+| `DSH_PHOENIX_DEFER_POLICY` | `auto` | `auto` (force at hard deadline) or `wait` (never force; may defer indefinitely) |
 | `DSH_PHOENIX_HEALTH_MS` | `4000` | browser heartbeat interval |
 | `DSH_PHOENIX_RESTART_CMD` | *(empty)* | custom restart command override for non-systemd deployments (see the Requirements warning) |
-| `DSH_PHOENIX_REARM_MS` | `8000` | initial delay before the goal re-arm check |
-| `DSH_PHOENIX_REARM_RETRY_MS` | `5000` | re-check interval while waiting for a re-armable goal |
-| `DSH_PHOENIX_MAX_REARM_ATTEMPTS` | `20` | cap on re-arm checks before giving up |
-| `DSH_PHOENIX_STATE_FILE` | *(empty)* | path to the checkpoint file that enables goal re-arm; empty disables it |
+| `DSH_PHOENIX_REARM_MS` | `8000` | boot delay before the lifecycle recovery/resume check |
+| `DSH_PHOENIX_MAX_RESUME_ATTEMPTS` | `1` | resume attempts per generation (1 = at-most-once) |
+| `DSH_PHOENIX_STATE_FILE` | *(empty)* | path to the durable lifecycle checkpoint; empty disables the lifecycle |
 
 ---
 
@@ -189,7 +252,7 @@ The claims in this README are backed by a reproducible checklist in
 tests). Quick start:
 
 ```sh
-npm test                                  # 10 tests: command build, sanitize, heartbeat, narrow trigger, idle defer, re-arm + one-shot, disabled mode
+npm test                                  # 17 tests: state machine transitions, resume at-most-once, stale/corrupt checkpoint, coalescing, defer escalation
 
 # after a real plugin update, watch the journal:
 journalctl --user -u dsh-web -f | grep dsh-phoenix

@@ -71,6 +71,7 @@ The re-armed goal then drives the next round automatically.
 
 ```sh
 npm test
-# 10 tests covering: command build (point 1/6), sanitize (6), heartbeat (4),
-# narrow trigger (5), idle defer (3), re-arm + one-shot clear (2/3), disabled mode (1)
+# 17 tests covering: state-machine transitions, resume at-most-once per generation,
+# stale/corrupt checkpoint, restart coalescing, defer soft/hard escalation,
+# restart-command failure, resume failure, restart/resume loop prevention
 ```

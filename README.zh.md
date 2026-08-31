@@ -101,6 +101,68 @@ dsh-phoenix 把它做得**优雅**（地步空闲——等到没有 agent 在跑
 
 ---
 
+## 🧭 耐久生命周期与安全重启语义
+
+"重启 → 恢复 → 续跑"是一条**显式、耐久**的状态机。状态**原子地**持久化到 `DSH_PHOENIX_STATE_FILE`（`.tmp` + `rename`），因此能在**任何一点崩溃后存活**，且坏/缺失的断点永远不会触发误续跑。
+
+### 状态
+
+```
+ IDLE ──重启请求──▶ DEFERRED ──安全点/截止──▶ RESTARTING ──启动/崩溃──▶ RECOVERING ──续跑──▶ RUNNING
+   ▲                                                                                                │
+   └────────────────────────────── 新请求（在途时合并） ◀────────────────────────────────────────────┘
+```
+
+| 状态 | 含义 |
+| --- | --- |
+| `idle` | 无待重启 |
+| `deferred` | 已请求重启但有 agent 在跑；等待安全点 |
+| `restarting` | 重启已调度（`systemd-run`） |
+| `recovering` | 重启/崩溃后启动；对记录的目标做有界、幂等的续跑 |
+| `running` | 已安定；无残留待重启 |
+
+### 迁移与不变量
+
+- `idle`/`running` — *重启请求* → `deferred`（忙）或 `restarting`（闲）；铸造新 `generation`。
+- `deferred` — *安全点* → `restarting`；*硬截止* → `restarting`（强制，有日志）。
+- `restarting` — *启动 / 崩溃* → `recovering`。
+- `recovering` — *续跑（至多一次）* → `running`。
+
+**不变量**
+- `RESTARTING`：不得再调度第二个重启（请求合并）。
+- `RECOVERING`：只对记录的 `generation` 续跑；**stale** `goalId`（无匹配活体目标）被失效化，绝不续跑。
+- `RUNNING`：不得残留 `pendingResume`。
+
+### 续跑语义——每个 generation 至多一次
+
+`pendingResume` 不是松散布尔；断点还记录 `generation`、`goalId`、`resumeAttempt`。调用 `goals.resume()` **之前**，插件会**原子地**先递增 `resumeAttempt`。若进程在续跑中途崩溃，下次启动会看到 `resumeAttempt >= maxResumeAttempts`（默认 `1`）并**不再续跑**——所以目标**每个 generation 至多被续跑一次**。不存在无限重启/续跑循环：在途重启会被合并，失败/耗尽后安定到 `running` 并清掉 `pendingResume`。
+
+### 安全截止，而非"到点就重启"
+
+defer 超时是一个**带升级的截止期**，不是无条件定时器：
+
+```
+deferred（agent 忙）
+  ├─ 软截止   → 记录 WARNING（agent 仍忙）
+  └─ 硬截止   → 若策略为 'auto' 则强制重启（有日志）
+                 若策略为 'wait' 则继续等（不强制）
+```
+
+`DSH_PHOENIX_DEFER_POLICY=auto`（默认）保留对无限 defer 的保护；`wait` 取消强制重启（你接受可能很长的 defer）。**Phoenix 无法区分"agent 忙"与"agent 处于关键区"**——DSH 不暴露此类信号——因此"忙"被当作不可重启，靠截止期兜底。
+
+### 验收答案
+
+1. **任意一点崩溃？** 耐久状态存活；启动时在途状态（`deferred`/`restarting`/`recovering`）进入 `recovering` 并幂等地安定。
+2. **同一目标被重复续跑？** 不会——每个 `generation` 至多一次（调用前**原子递增** `resumeAttempt`）。
+3. **stale 断点触发续跑？** 不会——缺失/损坏断点归为 `idle`；匹配不到活体目标的 `goalId` 被失效化，不续跑。
+4. **重复更新事件→重复重启？** 不会——在途请求合并，重复事件只产生一次重启。
+5. **无限重启/续跑循环？** 不会——在途合并、续跑次数上限、失败/耗尽后安定到 `running`。
+6. **defer 截止而 agent 仍忙？** 软→告警；硬→强制（`auto`）或继续等（`wait`），均有日志。
+7. **忙 vs 关键区？** Phoenix 无法区分（DSH 无关键区信号）；把"忙"当作不可重启，靠安全截止兜底。
+8. **迁移确定且可测？** 是——状态机是纯函数（见 `tests/`，17 项，含崩溃/stale/重复/失败注入）。
+
+---
+
 ## 📦 环境要求
 
 > [!WARNING]
@@ -160,12 +222,13 @@ dsh --profile <profile>
 | `DSH_PHOENIX_ARMING_MS` | `5000` | 加载后 N 毫秒内忽略信号（防自触发） |
 | `DSH_PHOENIX_DEBOUNCE_MS` | `3000` | 把突发信号合并为一次重启 |
 | `DSH_PHOENIX_DEFER_POLL_MS` | `3000` | 延后期间的空闲复查间隔 |
-| `DSH_PHOENIX_DEFER_CAP_MS` | `300000` | 延后上限，超时则强制重启 |
+| `DSH_PHOENIX_DEFER_SOFT_MS` | `300000` | 软安全截止——到点记告警，继续等待 |
+| `DSH_PHOENIX_DEFER_HARD_MS` | `900000` | 硬安全截止——到点强制重启（若策略为 `auto`） |
+| `DSH_PHOENIX_DEFER_POLICY` | `auto` | `auto`（硬截止时强制）或 `wait`（永不强制；可能长久延后） |
 | `DSH_PHOENIX_HEALTH_MS` | `4000` | 浏览器心跳间隔 |
 | `DSH_PHOENIX_RESTART_CMD` | *(空)* | 非 systemd 部署的自定义重启命令覆盖（见环境要求警告） |
 | `DSH_PHOENIX_REARM_MS` | `8000` | 目标重新武装检查的初始延迟 |
-| `DSH_PHOENIX_REARM_RETRY_MS` | `5000` | 等待可重新武装目标时的复查间隔 |
-| `DSH_PHOENIX_MAX_REARM_ATTEMPTS` | `20` | 重新武装检查的最大次数（超出则放弃） |
+| `DSH_PHOENIX_MAX_RESUME_ATTEMPTS` | `1` | 每个 generation 的续跑次数上限（1 = 至多一次） |
 | `DSH_PHOENIX_STATE_FILE` | *(空)* | 启用目标重新武装所需的断点文件路径；为空则禁用 |
 
 ---
@@ -184,10 +247,10 @@ dsh --profile <profile>
 
 ## ✅ 如何验证它生效
 
-本 README 中的结论由 **[docs/VERIFY.md](docs/VERIFY.md)** 的可复现清单 + 单测（`npm test`，10 项）支撑。快速开始：
+本 README 中的结论由 **[docs/VERIFY.md](docs/VERIFY.md)** 的可复现清单 + 单测（`npm test`，17 项）支撑。快速开始：
 
 ```sh
-npm test                                  # 10 项：命令构建、sanitize、心跳、窄触发、空闲延后、re-arm+一次性、禁用模式
+npm test                                  # 17 项：状态机迁移、续跑至多一次、stale/损坏断点、合并、defer 升级
 
 # 在真实插件更新后，观察 journal：
 journalctl --user -u dsh-web -f | grep dsh-phoenix
