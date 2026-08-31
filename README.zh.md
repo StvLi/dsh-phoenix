@@ -71,6 +71,21 @@ DeepSeek Harness 是"一切都是插件"，而 dsh Web 是由 *systemd* 托管�
 
 dsh-doctor 与 dsh-daemon 是在"救活启动"；**dsh-phoenix 让"生命周期"变得优雅、连接、可续跑。** 它们互补——dsh-phoenix 可以舒服地架在 dsh-daemon 管理的进程之上。
 
+### 互补而非竞争——热装 / 热重载
+
+还有一族插件在上层**彻底避免重启**：[`dsh-hot-installer`](https://github.com/KYinCode/dsh-hot-installer)、[`dsh-hot-reload`](https://github.com/stuarthu/dsh-hot-reload)（npm：[`dsh-hot-reload`](https://www.npmjs.com/package/dsh-hot-reload)、[`@deepforce/dsh-plugin-reloader`](https://www.npmjs.com/package/@deepforce/dsh-plugin-reloader)）。当你用 **CLI `dsh plugin add`** 装插件时，它们会**就地热装、不重启 dsh**——在变更入口处就把重启挡掉。
+
+dsh-phoenix 则在**再下一层**：对确实仍会发生的重启——通过 dsh **cordis 工具**改动插件树、或热重载失败并标记需要重启——把它做得**优雅**（地步空闲）、**连接**（浏览器心跳）、**可续跑**（目标重新武装）。
+
+**触发边界清晰：**
+
+| 变更路径 | 由谁处理 | dsh-phoenix 是否重启 |
+| --- | --- | --- |
+| `dsh plugin add`（CLI） | 热装 / 热重载家族 → 就地热装 | **否** |
+| 通过 dsh **cordis 工具**（`cordis_run`）改动插件树 | dsh-phoenix | **是**，优雅重启 |
+
+所以它们不竞争——hot 家族挡住*不必要的*重启；dsh-phoenix 把*必要的*重启变得安全、连接、可续跑。
+
 ---
 
 ## 📦 环境要求

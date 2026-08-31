@@ -71,6 +71,21 @@ The checkpoint is the loop's durable memory; the goal is its driver; the re-arm 
 
 dsh-doctor and dsh-daemon heal the *launch*; **dsh-phoenix makes the *lifetime* graceful, connected, and resumable.** They are complementary — dsh-phoenix sits comfortably on top of a dsh-daemon-managed process.
 
+### Complement, not a competitor — hot-install & hot-reload
+
+There is a whole family that avoids the restart *entirely*, one layer up: [`dsh-hot-installer`](https://github.com/KYinCode/dsh-hot-installer), [`dsh-hot-reload`](https://github.com/stuarthu/dsh-hot-reload) (npm: [`dsh-hot-reload`](https://www.npmjs.com/package/dsh-hot-reload), [`@deepforce/dsh-plugin-reloader`](https://www.npmjs.com/package/@deepforce/dsh-plugin-reloader)). When you `dsh plugin add` a plugin from the CLI, they load it **live, with no dsh restart** — they block the reboot right at the change entry.
+
+dsh-phoenix lives **one layer down**: for the restarts that still legitimately happen — the plugin tree is changed through the dsh **cordis tools**, or a hot reload fails and flags a restart — it makes them **graceful** (idle-aware), **connected** (browser heartbeat), and **resumable** (goal re-arm).
+
+**The trigger boundary is clean:**
+
+| Change path | Who handles it | Does dsh-phoenix restart? |
+| --- | --- | --- |
+| `dsh plugin add` (CLI) | hot-install / hot-reload family → live install | **No** |
+| Change the plugin tree via the dsh **cordis tools** (`cordis_run`) | dsh-phoenix | **Yes**, gracefully |
+
+So they don't compete — the hot family prevents *unnecessary* restarts; dsh-phoenix makes the *necessary* ones safe, connected, and resumable.
+
 ---
 
 ## 📦 Requirements
