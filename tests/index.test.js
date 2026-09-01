@@ -22,7 +22,8 @@ delete process.env.DSH_PHOENIX_RESTART_CMD
 const mod = await import('../lib/index.js')
 const {
   apply, defaultState, parseState, requestRestart, reachSafePoint, deferDecision,
-  beginRecovery, resumeDecision, markResumeStarted, afterResume, buildRestartCommand, sanitizeUnit,
+  beginRecovery, resumeDecision, markResumeStarted, afterResume, buildRestartCommand,
+  sanitizeUnit, heartbeatScript,
 } = mod
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -52,6 +53,20 @@ after(() => { try { rmSync(tmp, { recursive: true, force: true }) } catch (e) { 
 // ---------------------------------------------------------------------------
 // Pure state machine — the deterministic core
 // ---------------------------------------------------------------------------
+
+test('heartbeatScript: injects valid JS that polls and reloads on token change', () => {
+  const html = heartbeatScript('tok', '/__dsh_health', 4000)
+  assert.match(html, /\/__dsh_health/)
+  assert.match(html, /location\.reload\(\)/)
+  assert.match(html, /setInterval\(chk,/)
+  assert.match(html, /var last="tok"/)
+  // The browser refuses a malformed script entirely -> heartbeat never runs.
+  const js = html.replace(/^<script async>/, '').replace(/<\/script>$/, '')
+  assert.doesNotThrow(() => new Function(js), 'injected heartbeat must parse as valid JS')
+  const page = '<html><body>hi</body></html>'
+  const injected = page.replace('</body>', html + '</body>')
+  assert.match(injected, /\/__dsh_health/)
+})
 
 test('parseState: valid, malformed, empty all collapse to a usable state', () => {
   const ok = parseState('{"generation":3,"lifecycleState":"restarting","pendingResume":true,"goalId":"g1"}')

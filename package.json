@@ -1,6 +1,6 @@
 {
   "name": "dsh-phoenix",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Graceful restart + client auto-reconnect + cross-restart goal continuation for DeepSeek Harness (dsh). After a plugin update dsh-phoenix restarts dsh at a safe idle boundary, keeps the browser page connected, and resumes a running goal so a task can keep evolving across restarts.",
   "type": "module",
   "main": "./lib/index.js",
