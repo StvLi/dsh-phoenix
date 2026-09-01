@@ -11,8 +11,8 @@ writeFileSync(stateFile, JSON.stringify({ generation: 0, lifecycleState: 'idle',
 process.env.DSH_PHOENIX_ARMING_MS = '5'
 process.env.DSH_PHOENIX_DEBOUNCE_MS = '5'
 process.env.DSH_PHOENIX_DEFER_POLL_MS = '500'
-process.env.DSH_PHOENIX_DEFER_SOFT_MS = '100'
-process.env.DSH_PHOENIX_DEFER_HARD_MS = '200'
+process.env.DSH_PHOENIX_DEFER_SOFT_MS = '600000'
+process.env.DSH_PHOENIX_DEFER_HARD_MS = '1200000'
 process.env.DSH_PHOENIX_DEFER_POLICY = 'auto'
 process.env.DSH_PHOENIX_REARM_MS = '5'
 process.env.DSH_PHOENIX_REARM_RETRY_MS = '10'
@@ -37,7 +37,7 @@ function makeCtx(services) {
     on: (ev, fn) => { listeners[ev] = fn },
     effect: (fn) => fn(),
     timeout: (cb, ms) => { const t = setTimeout(cb, ms); return () => clearTimeout(t) },
-    interval: (cb, ms) => { const t = setInterval(cb, ms); return () => clearInterval(t) },
+    interval: (cb, ms) => { const t = setInterval(cb, ms); if (t && t.unref) t.unref(); return () => clearInterval(t) },
     debounce: (cb, ms) => {
       let timer = null
       const fn = (...a) => { clearTimeout(timer); timer = setTimeout(() => cb(...a), ms) }
@@ -333,4 +333,22 @@ test('recovery: waits for a late-registering goal (bounded re-scan, no false sta
   await sleep(60)
   assert.equal(resumeCalls.length, 1, 'a goal registered shortly after boot is still resumed (no false stale)')
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'running')
+})
+
+test('defer: stays deferred while agent is busy below the hard deadline (no premature force)', async () => {
+  resetState({ lifecycleState: 'idle', generation: 0 })
+  const agents = [{ status: 'running' }]
+  const runCalls = []
+  const { ctx, listeners } = makeCtx({
+    agents: { list: () => agents },
+    goals: { get: () => null, resume: () => ({}) },
+    shell: { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
+  })
+  apply(ctx)
+  await sleep(20)
+  listeners['tools/result']({ name: 'cordis_run' })
+  await sleep(600) // one defer poll (500ms); agent still busy, hard deadline far away
+  assert.equal(runCalls.length, 0, 'must NOT force a restart while busy below the hard deadline')
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'deferred')
 })
