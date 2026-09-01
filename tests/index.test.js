@@ -15,6 +15,8 @@ process.env.DSH_PHOENIX_DEFER_SOFT_MS = '100'
 process.env.DSH_PHOENIX_DEFER_HARD_MS = '200'
 process.env.DSH_PHOENIX_DEFER_POLICY = 'auto'
 process.env.DSH_PHOENIX_REARM_MS = '5'
+process.env.DSH_PHOENIX_REARM_RETRY_MS = '10'
+process.env.DSH_PHOENIX_REARM_FIND_ATTEMPTS = '2'
 process.env.DSH_PHOENIX_MAX_RESUME_ATTEMPTS = '1'
 process.env.DSH_PHOENIX_STATE_FILE = stateFile
 delete process.env.DSH_PHOENIX_RESTART_CMD
@@ -57,7 +59,7 @@ after(() => { try { rmSync(tmp, { recursive: true, force: true }) } catch (e) { 
 test('heartbeatScript: injects valid JS that polls and reloads on token change', () => {
   const html = heartbeatScript('tok', '/__dsh_health', 4000)
   assert.match(html, /\/__dsh_health/)
-  assert.match(html, /location\.reload\(\)/)
+  assert.match(html, /location\.replace\(/)
   assert.match(html, /setInterval\(chk,/)
   assert.match(html, /var last="tok"/)
   // The browser refuses a malformed script entirely -> heartbeat never runs.
@@ -292,4 +294,43 @@ test('defer: busy -> deferred, idle -> restart (graceful)', async () => {
   await sleep(600) // defer poll (500ms) sees idle -> restart
   assert.equal(runCalls.length, 1, 'restart once idle')
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'restarting')
+})
+
+test('no state file: graceful restart still works (in-memory lifecycle)', async () => {
+  const prev = process.env.DSH_PHOENIX_STATE_FILE
+  process.env.DSH_PHOENIX_STATE_FILE = ''
+  const m2 = await import('../lib/index.js?nofile=' + Date.now())
+  process.env.DSH_PHOENIX_STATE_FILE = prev
+  const runCalls = []
+  const { ctx, listeners } = makeCtx({
+    agents: { list: () => [{ status: 'idle' }] },
+    goals: { get: () => null, resume: () => ({}) },
+    shell: { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
+  })
+  m2.apply(ctx)
+  await sleep(20)
+  listeners['tools/result']({ name: 'cordis_run' })
+  await sleep(30)
+  assert.equal(runCalls.length, 1, 'graceful restart works even without a state file')
+})
+
+test('recovery: waits for a late-registering goal (bounded re-scan, no false stale)', async () => {
+  resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'g1' })
+  let goalReady = false
+  const resumeCalls = []
+  const { ctx } = makeCtx({
+    agents: { list: () => [{ status: 'idle' }] },
+    goals: {
+      get: () => goalReady ? { id: 'g1', revision: 3, phase: 'active', activation: 'disarmed' } : null,
+      resume: (a, ref) => { resumeCalls.push(ref); return {} },
+    },
+    shell: { resolve: (r) => r, run: async () => ({ exitCode: 0 }) },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
+  })
+  apply(ctx)
+  setTimeout(() => { goalReady = true }, 12) // after first find (rearmMs=5) but before the re-scan retry
+  await sleep(60)
+  assert.equal(resumeCalls.length, 1, 'a goal registered shortly after boot is still resumed (no false stale)')
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'running')
 })
