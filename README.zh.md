@@ -133,9 +133,9 @@ dsh-phoenix 把它做得**优雅**（地步空闲——等到没有 agent 在跑
 - `RECOVERING`：只对记录的 `generation` 续跑；**stale** `goalId`（无匹配活体目标）被失效化，绝不续跑。
 - `RUNNING`：不得残留 `pendingResume`。
 
-### 续跑语义——每个 generation 至多一次
+### 续跑语义——持续续跑
 
-`pendingResume` 不是松散布尔；断点还记录 `generation`、`goalId`、`resumeAttempt`。调用 `goals.resume()` **之前**，插件会**原子地**先递增 `resumeAttempt`。若进程在续跑中途崩溃，下次启动会看到 `resumeAttempt >= maxResumeAttempts`（默认 `1`）并**不再续跑**——所以目标**每个 generation 至多被续跑一次**。不存在无限重启/续跑循环：在途重启会被合并，失败/耗尽后安定到 `running` 并清掉 `pendingResume`。
+`pendingResume` 不是松散布尔；断点还记录 `generation`、`goalId`、`resumeAttempt`。一个**被标记**的目标是续跑载体：dsh-phoenix 会在**每次重启后**都重新续跑它（每个重启/generation 至多一次），只要它仍处于 active。调用 `goals.resume()` **之前**，插件会**原子地**先递增 `resumeAttempt`，因此中途崩溃不会在同一重启里重复续跑同一个目标。续跑**被保留**（`goalId`/`pendingResume` 持续存在），直到目标完成、变 stale、或 `resumeAttempt` 耗尽（`maxResumeAttempts`）——这样既终止循环，又让目标能跨多次重启存活。
 
 ### 安全截止，而非"到点就重启"
 
@@ -153,7 +153,7 @@ deferred（agent 忙）
 ### 验收答案
 
 1. **任意一点崩溃？** 耐久状态存活；启动时在途状态（`deferred`/`restarting`/`recovering`）进入 `recovering` 并幂等地安定。
-2. **同一目标被重复续跑？** 不会——每个 `generation` 至多一次（调用前**原子递增** `resumeAttempt`）。
+2. **同一目标在同一重启里被重复续跑？** 不会——每个重启/generation 至多一次（调用前**原子递增** `resumeAttempt`）。被标记的目标会在后续每次重启时再次续跑（有意的持续续跑）。
 3. **stale 断点触发续跑？** 不会——缺失/损坏断点归为 `idle`；匹配不到活体目标的 `goalId` 被失效化，不续跑。
 4. **重复更新事件→重复重启？** 不会——在途请求合并，重复事件只产生一次重启。
 5. **无限重启/续跑循环？** 不会——在途合并、续跑次数上限、失败/耗尽后安定到 `running`。
@@ -228,7 +228,7 @@ dsh --profile <profile>
 | `DSH_PHOENIX_HEALTH_MS` | `4000` | 浏览器心跳间隔 |
 | `DSH_PHOENIX_RESTART_CMD` | *(空)* | 非 systemd 部署的自定义重启命令覆盖（见环境要求警告） |
 | `DSH_PHOENIX_REARM_MS` | `8000` | 目标重新武装检查的初始延迟 |
-| `DSH_PHOENIX_MAX_RESUME_ATTEMPTS` | `1` | 每个 generation 的续跑次数上限（1 = 至多一次） |
+| `DSH_PHOENIX_MAX_RESUME_ATTEMPTS` | `1` | 每个重启的续跑次数上限（1 = 每次重启续跑一次；>1 重试；达到则结束续跑） |
 | `DSH_PHOENIX_STATE_FILE` | *(空)* | 启用目标重新武装所需的断点文件路径；为空则禁用 |
 
 ---
@@ -250,7 +250,7 @@ dsh --profile <profile>
 本 README 中的结论由 **[docs/VERIFY.md](docs/VERIFY.md)** 的可复现清单 + 单测（`npm test`，17 项）支撑。快速开始：
 
 ```sh
-npm test                                  # 17 项：状态机迁移、续跑至多一次、stale/损坏断点、合并、defer 升级
+npm test                                  # 21 项：状态机迁移、持续续跑、stale/损坏断点、合并、defer 升级
 
 # 在真实插件更新后，观察 journal：
 journalctl --user -u dsh-web -f | grep dsh-phoenix

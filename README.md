@@ -133,9 +133,9 @@ The restart → recovery → resume path is an explicit, **durable** state machi
 - `RECOVERING`: resume is attempted only for the recorded `generation`; a **stale** `goalId` (no matching live goal) is invalidated, never resumed.
 - `RUNNING`: no stale `pendingResume` may remain active.
 
-### Resume semantics — at-most-once per generation
+### Resume semantics — persistent continuation
 
-`pendingResume` is not a loose boolean; the checkpoint also records `generation`, `goalId` and `resumeAttempt`. Before calling `goals.resume()` the plugin **durably increments** `resumeAttempt` (atomic write). If the process crashes mid-resume, the next boot sees `resumeAttempt >= maxResumeAttempts` (default `1`) and does **not** resume again — so a goal is resumed **at-most-once per generation**. There is no infinite restart/resume loop: an in-flight restart is coalesced, and a failed/exhausted resume settles to `running` and clears `pendingResume`.
+`pendingResume` is not a loose boolean; the checkpoint also records `generation`, `goalId` and `resumeAttempt`. A **marked** goal is a continuation target: dsh-phoenix re-resumes it **after every restart** (at-most-once *per restart/generation*) while it stays active. Before calling `goals.resume()` the plugin **durably increments** `resumeAttempt` (atomic write), so a crash mid-resume cannot resume the same goal twice for the same restart. The continuation is **kept** (`goalId`/`pendingResume` persist) until the goal completes, becomes stale, or `resumeAttempt` is exhausted (`maxResumeAttempts`) — which both stops the loop and lets the goal live across many restarts.
 
 ### Safety deadline, not "restart now regardless"
 
@@ -153,7 +153,7 @@ deferred (agent busy)
 ### Acceptance answers
 
 1. **Crash at every point?** The durable state survives; on boot a mid-cycle state (`deferred`/`restarting`/`recovering`) moves to `recovering` and settles idempotently.
-2. **Same goal resumed twice?** No — at-most-once per `generation` (`resumeAttempt` incremented durably *before* the call).
+2. **Same goal resumed twice [in one restart]?** No — at-most-once per restart/generation (`resumeAttempt` incremented durably *before* the call). A marked goal is re-resumed on each subsequent restart (intended continuation).
 3. **Stale checkpoint triggers a resume?** No — a missing/corrupt checkpoint collapses to `idle`; a `goalId` that matches no live goal is invalidated, not resumed.
 4. **Repeated update events → repeated restarts?** No — in-flight requests coalesce; duplicate events produce one restart.
 5. **Infinite restart/resume loop?** No — in-flight coalescing, resume-attempt cap, and settle-to-`running` on failure/exhaustion.
@@ -228,7 +228,7 @@ All knobs are environment variables with safe defaults — no configuration file
 | `DSH_PHOENIX_HEALTH_MS` | `4000` | browser heartbeat interval |
 | `DSH_PHOENIX_RESTART_CMD` | *(empty)* | custom restart command override for non-systemd deployments (see the Requirements warning) |
 | `DSH_PHOENIX_REARM_MS` | `8000` | boot delay before the lifecycle recovery/resume check |
-| `DSH_PHOENIX_MAX_RESUME_ATTEMPTS` | `1` | resume attempts per generation (1 = at-most-once) |
+| `DSH_PHOENIX_MAX_RESUME_ATTEMPTS` | `1` | resume attempts per restart (1 = one resume per restart; >1 retries; reaching it ends the continuation) |
 | `DSH_PHOENIX_STATE_FILE` | *(empty)* | path to the durable lifecycle checkpoint; empty disables the lifecycle |
 
 ---
@@ -252,7 +252,7 @@ The claims in this README are backed by a reproducible checklist in
 tests). Quick start:
 
 ```sh
-npm test                                  # 17 tests: state machine transitions, resume at-most-once, stale/corrupt checkpoint, coalescing, defer escalation
+npm test                                  # 21 tests: state machine transitions, persistent continuation, stale/corrupt checkpoint, coalescing, defer escalation
 
 # after a real plugin update, watch the journal:
 journalctl --user -u dsh-web -f | grep dsh-phoenix
