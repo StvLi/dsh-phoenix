@@ -24,8 +24,8 @@ delete process.env.DSH_PHOENIX_RESTART_CMD
 const mod = await import('../lib/index.js')
 const {
   apply, defaultState, parseState, requestRestart, reachSafePoint, deferDecision,
-  beginRecovery, resumeDecision, markResumeStarted, afterResume, buildRestartCommand,
-  sanitizeUnit, heartbeatScript,
+  beginRecovery, resumeDecision, markResumeStarted, afterResume, endContinuation,
+  buildRestartCommand, sanitizeUnit, heartbeatScript,
 } = mod
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -142,14 +142,19 @@ test('resumeDecision: attempt / exhausted / none (at-most-once per generation)',
   assert.equal(resumeDecision({ ...defaultState(), pendingResume: false }, { maxResumeAttempts: 1 }).action, 'none')
 })
 
-test('markResumeStarted + afterResume: one-shot + clear stale pending', () => {
+test('markResumeStarted + afterResume (keeps continuation) + endContinuation (clears)', () => {
   const pend = { ...defaultState(), pendingResume: true, resumeAttempt: 0, goalId: 'g1' }
   const marked = markResumeStarted(pend, { now: 5 })
   assert.equal(marked.resumeAttempt, 1)
   const done = afterResume(marked, { now: 6 })
   assert.equal(done.lifecycleState, 'running')
-  assert.equal(done.pendingResume, false)
-  assert.equal(done.goalId, null)
+  // continuation is KEPT so the goal is re-resumed after the next restart
+  assert.equal(done.pendingResume, true)
+  assert.equal(done.goalId, 'g1')
+  const ended = endContinuation(done, { now: 7 })
+  assert.equal(ended.lifecycleState, 'running')
+  assert.equal(ended.pendingResume, false)
+  assert.equal(ended.goalId, null)
 })
 
 test('full cycle state machine: idle -> restarting -> recovering -> running with at-most-once resume', () => {
@@ -165,7 +170,7 @@ test('full cycle state machine: idle -> restarting -> recovering -> running with
   s = markResumeStarted(s, { now: 3 })
   s = afterResume(s, { now: 4 })
   assert.equal(s.lifecycleState, 'running')
-  assert.equal(s.pendingResume, false)
+  assert.equal(s.pendingResume, true, 'continuation is kept after resume')
 })
 
 // ---------------------------------------------------------------------------
@@ -187,7 +192,7 @@ function bootCtx(overrides = {}) {
   return { ctx, resumeCalls, runCalls }
 }
 
-test('recovery: resumes matching disarmed goal once, settles to running, clears pending', async () => {
+test('recovery: resumes matching disarmed goal once, settles to running, keeps continuation', async () => {
   resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'g1' })
   const { ctx, resumeCalls } = bootCtx()
   apply(ctx)
@@ -195,7 +200,8 @@ test('recovery: resumes matching disarmed goal once, settles to running, clears 
   assert.equal(resumeCalls.length, 1, 'resume called exactly once')
   const final = JSON.parse(readFileSync(stateFile, 'utf8'))
   assert.equal(final.lifecycleState, 'running')
-  assert.equal(final.pendingResume, false)
+  assert.equal(final.pendingResume, true, 'continuation is kept so the goal survives the next restart')
+  assert.equal(final.goalId, 'g1')
   assert.equal(final.generation, 7)
 })
 
@@ -210,7 +216,7 @@ test('recovery: stale goalId -> no resume, settles to running', async () => {
   assert.equal(final.pendingResume, false)
 })
 
-test('recovery: resume throws -> still settles to running (no loop)', async () => {
+test('recovery: resume throws -> still settles to running (bounded, no loop)', async () => {
   resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'g1' })
   const { ctx, resumeCalls } = bootCtx({
     goals: { get: () => ({ id: 'g1', revision: 3, phase: 'active', activation: 'disarmed' }), resume: () => { throw new Error('boom') } },
@@ -219,7 +225,8 @@ test('recovery: resume throws -> still settles to running (no loop)', async () =
   await sleep(20)
   const final = JSON.parse(readFileSync(stateFile, 'utf8'))
   assert.equal(final.lifecycleState, 'running')
-  assert.equal(final.pendingResume, false, 'no stale pending after failed resume')
+  assert.equal(final.resumeAttempt, 1, 'resumeAttempt incremented before the call (bounded)')
+  assert.equal(final.pendingResume, true, 'continuation kept; a later boot would exhaust attempts and end it')
 })
 
 test('recovery: corrupt/missing checkpoint -> fresh running, no resume', async () => {
