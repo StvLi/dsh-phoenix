@@ -190,8 +190,9 @@ dsh plugin --profile <profile> add dsh-phoenix
 # git（需 prepare 构建 + pnpm >= 10 的 allowBuilds）
 dsh plugin --profile <profile> add github:StvLi/dsh-phoenix
 
-# tarball
-pnpm pack && dsh plugin --profile <profile> add ./dsh-phoenix-0.1.0.tgz
+# tarball（先打包；文件名跟随包版本，故动态读取）
+TARBALL=$(npm pack 2>/dev/null | tail -1)   # 例：dsh-phoenix-0.2.6.tgz
+dsh plugin --profile <profile> add "$TARBALL"
 ```
 
 然后校验该层并启动：

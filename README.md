@@ -190,8 +190,9 @@ dsh plugin --profile <profile> add dsh-phoenix
 # git (needs a prepare build + allowBuilds on pnpm >= 10)
 dsh plugin --profile <profile> add github:StvLi/dsh-phoenix
 
-# tarball
-pnpm pack && dsh plugin --profile <profile> add ./dsh-phoenix-0.1.0.tgz
+# tarball (pack once; the filename follows the package version, so read it back)
+TARBALL=$(npm pack 2>/dev/null | tail -1)   # e.g. dsh-phoenix-0.2.6.tgz
+dsh plugin --profile <profile> add "$TARBALL"
 ```
 
 Then verify the layer and start:
