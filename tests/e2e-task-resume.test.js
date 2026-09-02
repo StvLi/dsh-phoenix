@@ -184,3 +184,27 @@ test('E2E: degrades gracefully when the task-resume services are absent (goal st
   const final = JSON.parse(readFileSync(stateFile, 'utf8'))
   assert.equal(final.lifecycleState, 'running', 'state settles even when task resume is unavailable')
 })
+
+// Regression: recover() must settle the durable state machine synchronously and
+// NOT race a re-scan. Before this fix recover() awaited the task-resume, so a
+// slow environment let a second recover() read a mid-recovery state (still
+// "recovering"/"deferred") and prematurely end the continuation. A "stale
+// goalId" (re-scan path) is the tightest reproduction.
+test('E2E: stale goalId settles to running, continuation not prematurely ended', async () => {
+  resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'NOT-THERE' })
+  const services = {
+    agents: { list: () => [{ id: 'g1', status: 'idle' }], get: () => undefined },
+    goals: { get: () => ({ id: 'g1', revision: 3, phase: 'active', activation: 'disarmed', maxGoalRounds: 3 }), resume: () => ({}) },
+    shell: { resolve: (r) => r, run: async () => ({ exitCode: 0 }) },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
+    agentLoop: { resume: async () => ({ agent: { id: 'g1' } }), create: async () => ({ agent: { id: 'g1' } }) },
+    agentPresets: { resolve: async (id) => ({ id }), mount: async () => {} },
+    sessionPersistence: { inspect: async (id) => ({ meta: { id, agentPreset: 'cordis' }, events: [] }) },
+  }
+  const { ctx } = makeCtx(services)
+  apply(ctx)
+  await sleep(60) // rearmRetryMs=10 * rearmFindAttempts=2 + margin
+  const final = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.equal(final.lifecycleState, 'running', 'state machine settles to running after the stale re-scan')
+  assert.equal(final.pendingResume, false, 'no goal matching stale goalId -> continuation ended')
+})
