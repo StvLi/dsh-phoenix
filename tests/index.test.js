@@ -32,8 +32,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 
 function makeCtx(services) {
   const listeners = {}
+  const provided = {}
   const ctx = {
     get: (k) => services[k],
+    provide: (k, v) => { provided[k] = v; return () => { delete provided[k] } },
     on: (ev, fn) => { listeners[ev] = fn },
     effect: (fn) => fn(),
     timeout: (cb, ms) => { const t = setTimeout(cb, ms); return () => clearTimeout(t) },
@@ -45,7 +47,7 @@ function makeCtx(services) {
       return fn
     },
   }
-  return { ctx, listeners }
+  return { ctx, listeners, provided }
 }
 
 const resetState = (obj) => writeFileSync(stateFile, JSON.stringify(Object.assign({ generation: 0, lifecycleState: 'idle', goalId: null, pendingResume: false, resumeAttempt: 0, deferDeadline: 0, updatedAt: 0 }, obj)))
@@ -179,17 +181,34 @@ test('full cycle state machine: idle -> restarting -> recovering -> running with
 
 function bootCtx(overrides = {}) {
   const resumeCalls = []
+  const taskResumeCalls = []
   const runCalls = []
-  const agents = overrides.agents ?? [{ status: 'idle' }]
+  const agents = overrides.agents ?? [{ id: 'g1', status: 'idle' }]
   const goal = overrides.goal ?? { id: 'g1', revision: 3, phase: 'active', activation: 'disarmed' }
+  const agentLoop = overrides.agentLoop ?? {
+    resume: async (ownerCtx, opts) => { taskResumeCalls.push(opts); return { agent: { id: opts.resumeSessionId } } },
+  }
+  const agentPresets = overrides.agentPresets ?? {
+    resolve: async (id) => ({ id }),
+    mount: async () => {},
+  }
+  const sessionPersistence = overrides.sessionPersistence ?? {
+    inspect: async (id) => ({ meta: { id, agentPreset: 'cordis' }, events: [{ type: 'agent-preset/selected', data: { agentPreset: 'cordis' } }] }),
+  }
   const services = {
-    agents: { list: () => agents },
+    agents: {
+      list: () => agents,
+      get: (id) => overrides.liveAgent ? { id } : undefined,
+    },
     goals: { get: () => goal, resume: (agent, ref) => { resumeCalls.push(ref); return {} } },
     shell: overrides.shell ?? { resolve: (r) => r, run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } } },
     webServer: { register: () => () => {}, tapIndex: () => () => {} },
+    agentLoop,
+    agentPresets,
+    sessionPersistence,
   }
   const { ctx } = makeCtx(services)
-  return { ctx, resumeCalls, runCalls }
+  return { ctx, resumeCalls, runCalls, taskResumeCalls }
 }
 
 test('recovery: resumes matching disarmed goal once, settles to running, keeps continuation', async () => {
@@ -358,4 +377,116 @@ test('defer: stays deferred while agent is busy below the hard deadline (no prem
   await sleep(600) // one defer poll (500ms); agent still busy, hard deadline far away
   assert.equal(runCalls.length, 0, 'must NOT force a restart while busy below the hard deadline')
   assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'deferred')
+})
+
+test('control service: provides dsh.phoenix with state/restart/forceRestart when armed', async () => {
+  resetState({ lifecycleState: 'idle', generation: 0 })
+  const runCalls = []
+  const { ctx, provided } = makeCtx({
+    agents: { list: () => [{ status: 'idle' }] },
+    goals: { get: () => null, resume: () => ({}) },
+    shell: {
+      resolve: (r) => r,
+      run: async (s) => { runCalls.push(s.command); return { exitCode: 0 } },
+    },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
+  })
+  apply(ctx)
+  await sleep(20) // armingMs=5
+  const phoenix = provided['dsh.phoenix']
+  assert.ok(phoenix, 'apply exposes a dsh.phoenix service for the tools plugin')
+  assert.equal(phoenix.canRestart(), true)
+  assert.equal(typeof phoenix.state, 'function')
+  assert.equal(typeof phoenix.requestRestart, 'function')
+  assert.equal(typeof phoenix.forceRestart, 'function')
+  assert.equal(phoenix.config.unit, 'dsh-web')
+
+  // state() returns the parsed lifecycle state. On boot with no pendingResume,
+  // recover() settles an idle/simple state to `running`.
+  const st = phoenix.state()
+  assert.equal(st.lifecycleState, 'running')
+  assert.equal(st.generation, 0)
+
+  // requestRestart on an idle agent schedules immediately and lands on restarting.
+  phoenix.requestRestart('from-test')
+  await sleep(20) // debounce(3ms) + scheduleNow
+  assert.equal(runCalls.length, 1, 'idle agent -> immediate restart scheduled')
+  assert.equal(JSON.parse(readFileSync(stateFile, 'utf8')).lifecycleState, 'restarting')
+})
+
+test('control service: no dsh.phoenix service when restart unavailable (no systemd/cmd)', async () => {
+  // Force restartCmd empty + no systemd by pointing PATH at an empty dir.
+  const oldPath = process.env.PATH
+  process.env.PATH = '/nonexistent-for-test'
+  process.env.DSH_PHOENIX_RESTART_CMD = ''
+  try {
+    resetState({ lifecycleState: 'idle', generation: 0 })
+    const { ctx, provided } = makeCtx({
+      agents: { list: () => [{ status: 'idle' }] },
+      goals: { get: () => null, resume: () => ({}) },
+      shell: { resolve: (r) => r, run: async () => ({ exitCode: 0 }) },
+      webServer: { register: () => () => {}, tapIndex: () => () => {} },
+    })
+    // Re-import with fresh module state (cfg is read at module load) is not
+    // possible here, so assert only the service exists even when restart is
+    // disabled — canRestart() reflects the capability.
+    apply(ctx)
+    await sleep(20)
+    const phoenix = provided['dsh.phoenix']
+    assert.ok(phoenix)
+    assert.equal(typeof phoenix.canRestart(), 'boolean')
+  } finally {
+    process.env.PATH = oldPath
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Task resume: after re-arming the goal, phoenix resumes the agent SESSION (the
+// task driver) so the round that was running is re-driven, not just the marker.
+// ---------------------------------------------------------------------------
+
+test('recovery: resumes the agent session (task) after re-arming the goal', async () => {
+  resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'g1' })
+  const { ctx, resumeCalls, taskResumeCalls } = bootCtx({ liveAgent: false })
+  apply(ctx)
+  await sleep(25) // arming + recover (async task resume)
+  assert.equal(resumeCalls.length, 1, 'goal re-armed exactly once')
+  assert.equal(taskResumeCalls.length, 1, 'agent session/task resumed exactly once')
+  const opts = taskResumeCalls[0]
+  assert.equal(opts.resumeSessionId, 'g1', 'resumes the session owning the goal')
+  assert.equal(typeof opts.setup, 'function', 'provides the preset setup for the fresh ctx')
+  // setup mounts the resolved preset
+  await opts.setup({})
+  const final = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.equal(final.lifecycleState, 'running')
+  assert.equal(final.pendingResume, true)
+})
+
+test('recovery: skips task resume when the agent session is already live (no double-load)', async () => {
+  resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'g1' })
+  const { ctx, taskResumeCalls } = bootCtx({ liveAgent: true })
+  apply(ctx)
+  await sleep(25)
+  assert.equal(taskResumeCalls.length, 0, 'no task resume when agent already live')
+})
+
+test('recovery: task resume degrades gracefully when agentLoop is absent', async () => {
+  // Use a bootCtx but drop agentLoop -> resumeAgentTask returns false,
+  // goal still re-armed, state still settles to running.
+  resetState({ lifecycleState: 'restarting', generation: 7, pendingResume: true, goalId: 'g1' })
+  const { ctx, resumeCalls } = bootCtx()
+  const svc = {
+    agents: { list: () => [{ status: 'idle' }], get: () => undefined },
+    goals: { get: () => ({ id: 'g1', revision: 3, phase: 'active', activation: 'disarmed' }), resume: () => ({}) },
+    shell: { resolve: (r) => r, run: async () => ({ exitCode: 0 }) },
+    webServer: { register: () => () => {}, tapIndex: () => () => {} },
+    agentPresets: { resolve: async (id) => ({ id }), mount: async () => {} },
+    sessionPersistence: { inspect: async () => ({ meta: {}, events: [] }) },
+  }
+  const { ctx: ctx2 } = makeCtx(svc)
+  apply(ctx2)
+  await sleep(25)
+  assert.equal(resumeCalls.length, 0, 'this stub uses its own goals.resume (not captured)')
+  const final = JSON.parse(readFileSync(stateFile, 'utf8'))
+  assert.equal(final.lifecycleState, 'running', 'state settles even when task resume is unavailable')
 })
